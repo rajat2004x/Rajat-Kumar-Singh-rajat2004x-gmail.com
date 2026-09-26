@@ -12,7 +12,19 @@
 // register something. That is the intended starting line.
 
 import { registerAuthRoutes } from './auth.js';
+import { registerAuditRoutes } from './audit.js';
+import { registerDeviceRoutes } from './devices.js';
+import { registerMemberRoutes } from './members.js';
+import { registerOrgRoutes } from './orgs.js';
+import { registerInviteRoutes } from './invites.js';
+import { registerSessionRoutes } from './sessions.js';
 
 export function registerRoutes(router, deps) {
   registerAuthRoutes(router, deps);
+  registerDeviceRoutes(router, deps);
+  registerAuditRoutes(router, deps);
+  registerSessionRoutes(router, deps);
+  registerMemberRoutes(router, deps);
+  registerOrgRoutes(router, deps);
+  registerInviteRoutes(router, deps);
 }
