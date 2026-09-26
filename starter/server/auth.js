@@ -71,12 +71,56 @@ export function issueAccessToken({ userId, orgId, role, permVersion }, secret) {
 // `node scripts/check-jwt.js` is the public test suite for this function.
 // ---------------------------------------------------------------------------
 export function verifyAccessToken(token, secret) {
-  // YOURS TO WRITE. Every failure mode listed above must be a 401 UNAUTHENTICATED.
-  // `node scripts/check-jwt.js` is the public suite for this function.
-  throw Object.assign(
-    new Error('TODO: server/auth.js — verifyAccessToken() is yours to write (AUTH-DATA-MODEL.md §10).'),
-    { code: 'NOT_IMPLEMENTED' }
-  );
+  try {
+    if (typeof token !== 'string') throw new Error('invalid token');
+
+    const segments = token.split('.');
+    if (segments.length !== 3 || segments.some((segment) => segment.length === 0)) {
+      throw new Error('invalid token structure');
+    }
+
+    const decodeJson = (segment) => {
+      if (!/^[A-Za-z0-9_-]+$/.test(segment) || segment.length % 4 === 1) {
+        throw new Error('invalid base64url');
+      }
+      const value = JSON.parse(unb64(segment).toString('utf8'));
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('invalid JSON object');
+      }
+      return value;
+    };
+
+    const [encodedHeader, encodedPayload, encodedSignature] = segments;
+    const header = decodeJson(encodedHeader);
+    const claims = decodeJson(encodedPayload);
+
+    if (header.alg !== ALG || header.typ !== 'JWT') throw new Error('invalid header');
+    if (!/^[A-Za-z0-9_-]+$/.test(encodedSignature) || encodedSignature.length % 4 === 1) {
+      throw new Error('invalid signature');
+    }
+
+    const actualSignature = unb64(encodedSignature);
+    const expectedSignature = createHmac('sha256', secret)
+      .update(`${encodedHeader}.${encodedPayload}`)
+      .digest();
+    if (
+      actualSignature.length !== expectedSignature.length ||
+      !timingSafeEqual(actualSignature, expectedSignature)
+    ) {
+      throw new Error('invalid signature');
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (claims.iss !== ISS || claims.aud !== AUD) throw new Error('invalid claims');
+    if (typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now) {
+      throw new Error('invalid expiry');
+    }
+    if (typeof claims.jti !== 'string' || claims.jti.length === 0) throw new Error('invalid jti');
+
+    return claims;
+  } catch {
+    throw unauthenticated('invalid access token');
+  }
 }
 
 

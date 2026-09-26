@@ -34,6 +34,22 @@ What did the starting line actually look like, and which failure surprised you?_
 _What did you expect each failure mode to look like before you ran it? Which one behaved
 differently from your expectation, and what did that tell you?_
 
+### 2026-09-27 · access-token verifier
+
+Investigated `server/auth.js`, `server/http.js`, `server/db.js`, `server/index.js`,
+`scripts/check-jwt.js`, `AUTH-DATA-MODEL.md`, and `README.md` before coding. The initial
+hypothesis was straightforward: `verifyAccessToken` was still a stub, so neither valid tokens
+nor invalid tokens could be verified through the required authentication error path.
+
+Implemented strict three-segment JWT parsing, base64url and JSON-object validation, fixed HS256
+and JWT-type pinning, HMAC-SHA256 verification with constant-time signature comparison, issuer
+and audience checks, expiry validation with `exp == now` treated as expired, and non-empty `jti`
+validation. The verifier preserves the signed claims and does not perform membership freshness or
+permission resolution; those belong to the request context and authorization layers.
+
+Ran `node starter/scripts/check-jwt.js`: **43 passed, 0 failed**. Diagnostics reported no
+problems, and the implementation change was confined to `server/auth.js`.
+
 ## Phase 2 — caller context and the resolution engine
 
 _This is where most people's first model is wrong. Write down the model you started with, the

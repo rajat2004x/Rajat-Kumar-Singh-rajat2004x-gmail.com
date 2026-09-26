@@ -23,6 +23,23 @@ Rules, from `DISCOVERY-BRIEF.md`:
 
 ---
 
+### The access-token verifier performs cryptographic validation only
+
+**What I chose:** `verifyAccessToken` validates the JWT structure, decodes the header and payload,
+pins the algorithm to HS256 and the type to JWT, verifies the HMAC-SHA256 signature with a
+constant-time comparison, validates issuer, audience, expiry, and `jti`, then returns the signed
+claims unchanged.
+**Why:** The focused implementation check, `node starter/scripts/check-jwt.js`, passed all 43
+cases, including malformed tokens, algorithm substitution, signature tampering, expiry equality,
+issuer/audience failures, and missing or empty `jti`. Diagnostics also reported no problems.
+**What I rejected:** Putting membership lookup, `perm_version` freshness, or permission
+resolution inside the verifier. That alternative would mix cryptographic token authenticity with
+database-backed authorization, make the verifier responsible for more than the token it receives,
+and duplicate the request-context/permission boundaries that the starter defines.
+**What would change my mind:** A tested authentication contract that required the verifier itself
+to access the database, or evidence that a valid signed token could otherwise bypass the separate
+freshness and authorization checks.
+
 ### Stub — the shape of a weak "Why"
 
 **What I chose:** the obvious thing.
