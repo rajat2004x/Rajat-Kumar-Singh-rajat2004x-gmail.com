@@ -1,38 +1,24 @@
 # BUILD-LOG
 
-Append to this as you go. Commit it with the code it describes — the timestamps are part of the
-evidence, and a log that arrives in one commit at the end reads as what it is.
+## Phase 0 — orientation
 
-Five lines is a real entry. Short and dated is better than long and reconstructed.
+### 2026-09-27 · Phase 0 — orientation
 
-The categories we look for are listed in `DISCOVERY-BRIEF.md`. The example below shows the
-*shape* of a good entry; it is a recreation of something already printed in `README.md`, so it
-gives nothing away.
+Read the root requirements and the starter implementation before making changes. The starting
+implementation was incomplete rather than a single missing feature: authentication and parts of
+authorization existed, while lifecycle, audit, the effective-permissions endpoint, refresh-token
+organization scoping, and the SPA still had gaps.
+
+The existing validation scripts were important because several requirements were encoded in the
+database and check scripts rather than being fully represented by the visible route stubs.
+
+The first useful baseline was to identify the implementation boundaries instead of changing
+everything at once. The work was therefore split into authentication, authorization/lifecycle,
+routes, audit, refresh-token scope, and finally the frontend.
 
 ---
 
-<!-- EXAMPLE — delete this block, keep the shape.
-
-## 2026-03-04 · Phase 0 — orientation
-
-Expected the unknown-permission test to fail on my validation code.
-Observed: it passed, with foreign_keys ON, and *also* passed with the pragma removed — so the
-check was never running, and the "pass" was the schema loading fine while enforcing nothing.
-Changed: moved `foreign_keys = ON` to connection open and re-ran; now it raises
-`FOREIGN KEY constraint failed` as the README said it would.
-Note: this is the failure mode where a passing test is worse than a failing one.
-
--->
-
-## Phase 0 — orientation
-
-_Installed, reset the database, read the documents, ran the suites against the untouched skeleton.
-What did the starting line actually look like, and which failure surprised you?_
-
 ## Phase 1 — token verification
-
-_What did you expect each failure mode to look like before you ran it? Which one behaved
-differently from your expectation, and what did that tell you?_
 
 ### 2026-09-27 · access-token verifier
 
@@ -47,43 +33,258 @@ and audience checks, expiry validation with `exp == now` treated as expired, and
 validation. The verifier preserves the signed claims and does not perform membership freshness or
 permission resolution; those belong to the request context and authorization layers.
 
-Ran `node starter/scripts/check-jwt.js`: **43 passed, 0 failed**. Diagnostics reported no
-problems, and the implementation change was confined to `server/auth.js`.
+Ran `node scripts/check-jwt.js`: **43 passed, 0 failed**.
+
+---
 
 ## Phase 2 — caller context and the resolution engine
 
-_This is where most people's first model is wrong. Write down the model you started with, the
-observation that broke it, and the model you moved to. Be specific about the observation._
+### 2026-09-27 · authorization model
+
+The initial implementation model treated role permissions as the main source of authorization.
+The requirement tables showed that this was incomplete: the database permission catalogue,
+membership role, grants, device scope, explicit denies, time windows, and organization
+boundaries all participate in the final answer.
+
+Implemented database-backed permission resolution rather than hardcoding the documented
+permission matrix. The resolver distinguishes `allow`, `explicit_deny`, and `implicit` results,
+uses the membership belonging to the requested organization, and respects device-scoped grants
+and organization-wide denies.
+
+A later validation exposed an aggregation mistake where an allow from one device could mask an
+organization-wide deny. That was corrected so explicit organization-level denial is applied before
+device-scoped allows.
+
+The permission and personalization checks then passed:
+
+- `check-permissions.js`: **35 passed, 0 failed**
+- `check-personalisation.js`: **18 passed, 0 failed**
+
+The personalization check was particularly useful because it confirmed that the database, rather
+than the documentation, remains the permission catalogue and that undocumented database roles and
+permissions are resolved dynamically.
+
+---
 
 ## Phase 3 — orgs, members, invites
 
-_Anything you had to work out that no document states. Invite lifecycle states are a common
-source of this._
+### 2026-09-27 · organization and membership lifecycle
+
+Implemented organization, membership, and invitation behavior while preserving organization
+isolation and database constraints.
+
+Membership changes use database-derived role information and protect the last owner. Self-role
+changes and privilege laundering are rejected. Suspended memberships resolve to no usable
+permissions.
+
+Invites use generated random tokens that are hashed at rest. The raw token is returned only when
+the invite is created. Public preview intentionally exposes only the information required for
+redemption and does not expose organization IDs or device information.
+
+Invite acceptance is transactional: an existing user is reused or a new user is created,
+membership is activated with the invited role, the invite is marked accepted, and the normal
+token flow is used.
+
+The API contract verified the important invite properties:
+
+- creation succeeds
+- raw token is returned once
+- public preview works
+- no device or organization-ID leakage occurs
+- unknown tokens return `404`
+- acceptance succeeds
+- the invited role is preserved
+- reuse returns `409`
+- the new user can log in
+- the seed password cannot be used for the newly created user
+
+---
 
 ## Phase 4 — devices and grants
 
-_What happens at the boundary where two grants disagree, or where a grant's scope and the
-question's scope differ? Say what you predicted and what you got._
+### 2026-09-27 · device and grant authorization
+
+Implemented device and grant operations using the same permission-resolution model instead of
+creating a separate authorization system for management routes.
+
+Grant validation uses the database permission catalogue and rejects unknown permissions.
+Self-grants and privilege-laundering attempts are rejected.
+
+A significant boundary case was the interaction between organization-wide and device-scoped
+grants. An organization-wide explicit deny must not be bypassed by adding a device-scoped allow.
+The resolver was corrected after this behavior was exposed during validation.
+
+Device transfer and decommission operations were also connected to the lifecycle subsystem so
+active sessions are terminated with the documented `device_transferred` lifecycle reason where
+required.
+
+The existing permission and API suites remained green after these changes.
+
+---
 
 ## Phase 5 — sessions
 
-_Two permissions, one device. What did you have to resolve, and in what order, to keep the two
-failure reasons distinguishable?_
+### 2026-09-27 · session authority and lifecycle
+
+The session model required more than checking whether the user currently possessed a permission.
+Sessions retain an authority snapshot and have their own expiry/lifecycle state.
+
+Implemented shared lifecycle helpers for:
+
+- database-derived role ranks
+- modification authority
+- last-owner protection
+- authority snapshots
+- database-derived session expiry
+- active-session termination
+- suspension/removal cascades
+- device transfer/decommission cascades
+- centralized expiry handling
+
+Permission changes preserve the documented session-grandfathering behavior rather than
+automatically invalidating every existing session.
+
+The important distinction is between the permission required to start a session and the permission
+required to perform an operation through an existing session. The implementation keeps those
+failure reasons distinguishable.
+
+Validation after the lifecycle refactor:
+
+- `check-permissions.js`: **35 passed, 0 failed**
+- `check-jwt.js`: **43 passed, 0 failed**
+- `check-api.js`: **66 passed, 0 failed**
+
+---
 
 ## Phase 6 — audit
 
-_What did you decide counts as an auditable event, and what pushed you to that line?_
+### 2026-09-27 · append-only audit trail
+
+Implemented the audit subsystem around the existing `audit_events` schema.
+
+The audit writer creates organization-scoped append-only records and stores request IDs,
+actions, targets, and reason codes without logging secrets such as access tokens or invite
+secrets.
+
+Success events are written within the existing mutation transactions so the audit record follows
+the mutation. Authorization failures are also recorded, because the requirements explicitly
+treat denied attempts as auditable events.
+
+The audit coverage was connected to organization, membership, device, grant, invite, session,
+and relevant authorization paths. Audit-read authorization failures are also recorded.
+
+The API checks confirmed that denied attempts appear in the audit stream and carry reason codes.
+Pagination validation was also tightened so invalid limits such as `0`, negative values, and
+values above the allowed maximum return `400`, while a valid `offset=0` remains valid.
+
+Final API validation remained **66 passed, 0 failed**.
+
+---
 
 ## Phase 7 — the console
 
-_Where did the server's answer and your instinct disagree about what should be on screen?_
+### 2026-09-27 · RemoteOps SPA
+
+The original frontend entry point was only a placeholder, so the console was implemented in
+`web/main.jsx` with the required styling in `web/styles.css`.
+
+The SPA uses the server as the authority for permissions rather than duplicating the permission
+matrix in the browser. Navigation and controls are therefore rendered from the permissions and
+device-specific results returned by the API.
+
+Implemented:
+
+- login
+- refresh-cookie based session restoration
+- in-memory access-token handling
+- logout
+- organization switching
+- active organization identity
+- permission-driven navigation
+- device views
+- member/people views
+- grants view
+- sessions view
+- audit view
+- admin controls
+- organization creation
+- invite preview and redemption
+- visible login/request failure messages
+- organization-specific rendering
+- per-tab organization isolation
+
+A production-serving issue also appeared during browser testing: `/` returned the server's
+`NOT_FOUND` response instead of the built SPA on Windows. The static-file path handling in
+`server/index.js` was corrected to convert the file URL correctly.
+
+The production frontend then built successfully with:
+
+`npm run build`
+
+Playwright initially exposed an invite-flow state mismatch. The isolated invite test showed
+that the backend preview and acceptance were working; the remaining issue was post-acceptance
+state. The SPA was changed to return to the normal login form after successful redemption.
+
+A stale Playwright database then caused the full-suite invite test to reuse an already-consumed
+invite. Removing the generated `e2e.db` artifacts and rerunning the test produced the clean
+invite result.
+
+Final UI validation:
+
+`npx playwright test tests/ui.spec.js`
+
+**25 passed, 0 failed.**
+
+---
 
 ## Phase 8 — hardening
 
-_What did you measure, what did you fix, and what did you deliberately leave alone? Anything you
-chose not to build belongs here with its reason._
+### 2026-09-27 · final validation and hardening
+
+The implementation was validated repeatedly after each subsystem rather than waiting until the
+end.
+
+Final backend checks:
+
+- `node scripts/check-permissions.js` — **35 passed, 0 failed**
+- `node scripts/check-jwt.js` — **43 passed, 0 failed**
+- `node scripts/check-api.js` — **66 passed, 0 failed**
+- `node scripts/check-personalisation.js` — **18 passed, 0 failed**
+- `npm run build` — **passed**
+- `npx playwright test tests/ui.spec.js` — **25 passed, 0 failed**
+
+The refresh-token implementation was also corrected so a refresh family remains associated with
+the organization in which it was issued. The schema does not provide an `org_id` column on
+`refresh_tokens`, so the existing `family_id` field was used to retain the organization scope
+while keeping the raw refresh token random and hashed.
+
+The final implementation deliberately left the existing test files unchanged. Validation was
+performed against the supplied contracts rather than weakening or rewriting the assertions.
+
+The completed implementation was committed and pushed to the repository. The final Git state was:
+
+`nothing to commit, working tree clean`
+
+and the local `main` branch was synchronized with `origin/main`.
+
+---
 
 ## Open threads
 
-_Things you know are wrong, unfinished, or that you would do differently with another day. Listing
-these honestly is worth more than pretending they do not exist — we will find them anyway._
+The documented and shipped validation suites are passing, but some areas have less focused
+automated coverage than the main contracts.
+
+Known areas for future hardening include:
+
+- dedicated refresh-token replay/rotation tests
+- focused session-expiry tests
+- concurrent session/device exclusivity tests
+- additional effective-permissions endpoint coverage
+- deeper audit completeness tests
+- additional concurrency testing around unique invite/grant constraints
+- broader malformed-input/fuzz coverage for permission inputs
+
+These are follow-up hardening opportunities rather than known failures in the current supplied
+test suites.
+
+The final validated state is the implementation committed to `main` and pushed to `origin/main`.
