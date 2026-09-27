@@ -1,4 +1,5 @@
 import { assertCan } from '../permissions.js';
+import { auditDenials } from '../audit.js';
 import { badRequest, send } from '../http.js';
 
 function pageValue(value, field, defaultValue, maximum = Number.MAX_SAFE_INTEGER, minimum = 0) {
@@ -13,7 +14,9 @@ function pageValue(value, field, defaultValue, maximum = Number.MAX_SAFE_INTEGER
 
 export function registerAuditRoutes(router, { db }) {
   router.get('/v1/orgs/:org/audit', (ctx, _params, res) => {
-    assertCan(db, ctx, 'audit:read');
+    auditDenials(db, ctx, {
+      action: 'audit.list', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'audit:read'));
     const limit = pageValue(ctx.query.get('limit'), 'limit', 100, 1000, 1);
     const offset = pageValue(ctx.query.get('offset'), 'offset', 0);
     const events = db.prepare(

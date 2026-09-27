@@ -13,6 +13,19 @@ import { resolve } from '../permissions.js';
 const REFRESH_COOKIE = 'rt';
 const REFRESH_MAX_AGE = 30 * 24 * 60 * 60;
 
+function newRefreshFamilyId(orgId) {
+  return JSON.stringify({ orgId, lineage: randomUUID() });
+}
+
+function refreshFamilyOrgId(familyId) {
+  try {
+    const parsed = JSON.parse(familyId);
+    return typeof parsed?.orgId === 'string' && parsed.orgId ? parsed.orgId : null;
+  } catch {
+    return null;
+  }
+}
+
 function requireText(value, field) {
   if (typeof value !== 'string' || value.trim() === '') throw badRequest(`${field} is required`);
   return value.trim();
@@ -61,7 +74,7 @@ function publicOrganizations(db, userId) {
   }));
 }
 
-function issueRefresh(db, userId, membership, secret, res, familyId = randomUUID()) {
+function issueRefresh(db, userId, membership, secret, res, familyId = newRefreshFamilyId(membership.org_id)) {
   const raw = newRefreshToken();
   const expiresAt = new Date(Date.now() + REFRESH_MAX_AGE * 1000).toISOString();
   db.prepare(
@@ -138,7 +151,8 @@ export function registerAuthRoutes(router, { db, secret }) {
     }
     if (stored.expires_at <= now) throw unauthenticated('invalid refresh token');
 
-    const membership = selectMembership(db, stored.user_id);
+    const orgId = refreshFamilyOrgId(stored.family_id);
+    const membership = orgId ? selectMembership(db, stored.user_id, orgId) : null;
     if (!membership) throw unauthenticated('invalid refresh token');
 
     const rotate = db.transaction(() => {

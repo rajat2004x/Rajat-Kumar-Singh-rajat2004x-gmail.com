@@ -119,14 +119,14 @@ function unionPermissions(state, devicePermissions) {
 
   const permissions = {};
   for (const permission of state.permissions) {
-    const allowed = devicePermissions.find((device) => device[permission].effect === 'allow');
-    if (allowed) {
-      permissions[permission] = allowed[permission];
+    const explicitDeny = devicePermissions.find((device) => device[permission].reason === 'explicit_deny');
+    if (explicitDeny) {
+      permissions[permission] = explicitDeny[permission];
       continue;
     }
-    const explicitDeny = devicePermissions.find((device) => device[permission].reason === 'explicit_deny');
-    permissions[permission] = explicitDeny
-      ? explicitDeny[permission]
+    const allowedDevice = devicePermissions.find((device) => device[permission].effect === 'allow');
+    permissions[permission] = allowedDevice
+      ? allowedDevice[permission]
       : devicePermissions[0][permission];
   }
   return permissions;

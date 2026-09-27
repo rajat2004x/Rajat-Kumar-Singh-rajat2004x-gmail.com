@@ -1,5 +1,6 @@
 import { newId, nowIso } from '../db.js';
 import { assertCan } from '../permissions.js';
+import { audit, auditDenials } from '../audit.js';
 import { badRequest, conflict, notFound, send } from '../http.js';
 
 function text(value, field) {
@@ -69,6 +70,15 @@ export function registerOrgRoutes(router, { db }) {
           `INSERT INTO memberships (id, org_id, user_id, role, status, joined_at)
            VALUES (?, ?, ?, ?, 'active', ?)`
         ).run(membershipId, orgId, ctx.userId, role, nowIso());
+        audit(db, {
+          orgId,
+          actorId: ctx.userId,
+          action: 'org.create',
+          targetType: 'organization',
+          targetId: orgId,
+          result: 'allow',
+          requestId: ctx.requestId,
+        });
       })();
     } catch (error) {
       if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') throw conflict('organization already exists');
@@ -84,7 +94,9 @@ export function registerOrgRoutes(router, { db }) {
   });
 
   router.patch('/v1/orgs/:org', (ctx, params, res) => {
-    assertCan(db, ctx, 'org:update');
+    auditDenials(db, ctx, {
+      action: 'org.update', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'org:update'));
     const row = organization(db, ctx.orgId);
     if (!row) throw notFound();
     const updates = [];
@@ -105,16 +117,40 @@ export function registerOrgRoutes(router, { db }) {
     }
     if (!updates.length) throw badRequest('no organization fields to update');
     values.push(ctx.orgId);
-    db.prepare(`UPDATE organizations SET ${updates.join(', ')} WHERE id = ? AND deleted_at IS NULL`).run(...values);
+    db.transaction(() => {
+      db.prepare(`UPDATE organizations SET ${updates.join(', ')} WHERE id = ? AND deleted_at IS NULL`).run(...values);
+      audit(db, {
+        orgId: ctx.orgId,
+        actorId: ctx.userId,
+        action: 'org.update',
+        targetType: 'organization',
+        targetId: ctx.orgId,
+        result: 'allow',
+        requestId: ctx.requestId,
+      });
+    })();
     const updated = organization(db, params.org);
     send(res, 200, { org: organizationResponse(updated) });
   });
 
   router.delete('/v1/orgs/:org', (ctx, _params, res) => {
-    assertCan(db, ctx, 'org:delete');
+    auditDenials(db, ctx, {
+      action: 'org.delete', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'org:delete'));
     if (!organization(db, ctx.orgId)) throw notFound();
-    db.prepare('UPDATE organizations SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL')
-      .run(nowIso(), ctx.orgId);
+    db.transaction(() => {
+      db.prepare('UPDATE organizations SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL')
+        .run(nowIso(), ctx.orgId);
+      audit(db, {
+        orgId: ctx.orgId,
+        actorId: ctx.userId,
+        action: 'org.delete',
+        targetType: 'organization',
+        targetId: ctx.orgId,
+        result: 'allow',
+        requestId: ctx.requestId,
+      });
+    })();
     send(res, 200, { ok: true });
   });
 }

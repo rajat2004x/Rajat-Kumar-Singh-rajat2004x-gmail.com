@@ -10,6 +10,7 @@ import {
 } from '../auth.js';
 import { newId, nowIso } from '../db.js';
 import { assertCan } from '../permissions.js';
+import { audit, auditDenials } from '../audit.js';
 import {
   badRequest,
   conflict,
@@ -63,13 +64,13 @@ function ensureLiveInvite(row) {
   if (row.revoked_at || row.expires_at <= nowIso()) throw gone();
 }
 
-function storeRefreshToken(db, userId, res) {
+function storeRefreshToken(db, userId, orgId, res) {
   const raw = newRefreshToken();
   const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 86_400_000).toISOString();
   db.prepare(
     `INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at)
-     VALUES (?, ?, ?, ?, ?)`
-  ).run(newId('rt'), userId, hashRefreshToken(raw), randomUUID(), expiresAt);
+      VALUES (?, ?, ?, ?, ?)`
+    ).run(newId('rt'), userId, hashRefreshToken(raw), JSON.stringify({ orgId, lineage: randomUUID() }), expiresAt);
   res.setHeader(
     'set-cookie',
     `rt=${raw}; Max-Age=${REFRESH_TTL_DAYS * 24 * 60 * 60}; Path=/; HttpOnly; SameSite=Strict; Secure`
@@ -78,12 +79,19 @@ function storeRefreshToken(db, userId, res) {
 
 export function registerInviteRoutes(router, { db, secret }) {
   router.post('/v1/orgs/:org/invites', (ctx, _params, res) => {
-    assertCan(db, ctx, 'user:invite');
+    auditDenials(db, ctx, {
+      action: 'invite.create', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'user:invite'));
     const email = text(ctx.body.email, 'email').toLowerCase();
     const invitedRole = role(db, text(ctx.body.role, 'role'));
     const callerRole = role(db, ctx.role);
     const owner = topRole(db);
     if (invitedRole.rank >= callerRole.rank || (invitedRole.key === owner.key && callerRole.key !== owner.key)) {
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'invite.create',
+        targetType: 'organization', targetId: ctx.orgId, result: 'deny',
+        reasonCode: 'scope_mismatch', requestId: ctx.requestId,
+      });
       throw forbidden('you cannot assign this role', 'scope_mismatch');
     }
 
@@ -97,10 +105,17 @@ export function registerInviteRoutes(router, { db, secret }) {
     const rawToken = newInviteToken();
     const expiresAt = new Date(Date.now() + INVITE_TTL_DAYS * 86_400_000).toISOString();
     try {
-      db.prepare(
-        `INSERT INTO invites (id, org_id, email, role, token_hash, invited_by, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(newId('inv'), ctx.orgId, email, invitedRole.key, hashInviteToken(rawToken), ctx.userId, expiresAt);
+      db.transaction(() => {
+        const inviteId = newId('inv');
+        db.prepare(
+          `INSERT INTO invites (id, org_id, email, role, token_hash, invited_by, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(inviteId, ctx.orgId, email, invitedRole.key, hashInviteToken(rawToken), ctx.userId, expiresAt);
+        audit(db, {
+          orgId: ctx.orgId, actorId: ctx.userId, action: 'invite.create',
+          targetType: 'invite', targetId: inviteId, result: 'allow', requestId: ctx.requestId,
+        });
+      })();
     } catch (error) {
       if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') throw conflict('a live invite already exists');
       throw error;
@@ -109,7 +124,9 @@ export function registerInviteRoutes(router, { db, secret }) {
   });
 
   router.get('/v1/orgs/:org/invites', (ctx, _params, res) => {
-    assertCan(db, ctx, 'user:invite');
+    auditDenials(db, ctx, {
+      action: 'invite.list', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'user:invite'));
     const invites = db.prepare(
       `SELECT id, email, role, expires_at, accepted_at, revoked_at, created_at
          FROM invites
@@ -128,12 +145,20 @@ export function registerInviteRoutes(router, { db, secret }) {
   });
 
   router.delete('/v1/orgs/:org/invites/:id', (ctx, params, res) => {
-    assertCan(db, ctx, 'user:invite');
+    auditDenials(db, ctx, {
+      action: 'invite.revoke', targetType: 'invite', targetId: params.id,
+    }, () => assertCan(db, ctx, 'user:invite'));
     const invite = db.prepare(
       'SELECT id FROM invites WHERE id = ? AND org_id = ? AND accepted_at IS NULL AND revoked_at IS NULL'
     ).get(params.id, ctx.orgId);
     if (!invite) throw notFound();
-    db.prepare('UPDATE invites SET revoked_at = ? WHERE id = ? AND org_id = ?').run(nowIso(), invite.id, ctx.orgId);
+    db.transaction(() => {
+      db.prepare('UPDATE invites SET revoked_at = ? WHERE id = ? AND org_id = ?').run(nowIso(), invite.id, ctx.orgId);
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'invite.revoke',
+        targetType: 'invite', targetId: invite.id, result: 'allow', requestId: ctx.requestId,
+      });
+    })();
     send(res, 200, { ok: true });
   });
 
@@ -181,7 +206,11 @@ export function registerInviteRoutes(router, { db, secret }) {
       db.prepare(
         'UPDATE invites SET accepted_at = ?, accepted_by = ? WHERE id = ? AND accepted_at IS NULL AND revoked_at IS NULL'
       ).run(acceptedAt, userId, invite.id);
-      storeRefreshToken(db, userId, res);
+      storeRefreshToken(db, userId, invite.org_id, res);
+      audit(db, {
+        orgId: invite.org_id, actorId: userId, action: 'invite.accept',
+        targetType: 'invite', targetId: invite.id, result: 'allow', requestId: null,
+      });
     });
     complete();
     const token = issueAccessToken({

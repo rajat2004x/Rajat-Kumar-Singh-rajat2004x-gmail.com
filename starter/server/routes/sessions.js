@@ -1,5 +1,7 @@
 import { newId, nowIso } from '../db.js';
 import { assertCan, assertCanStartSession } from '../permissions.js';
+import { endActiveSessions, endExpiredSessions, sessionExpiry, snapshotAuthority } from '../lifecycle.js';
+import { audit, auditDenials } from '../audit.js';
 import { badRequest, deviceBusy, notFound, send } from '../http.js';
 
 const MODES = new Set(['view', 'control', 'terminal']);
@@ -12,14 +14,6 @@ function activeDevice(db, orgId, deviceId) {
   ).get(deviceId, orgId);
 }
 
-function expireSessions(db, orgId, at) {
-  db.prepare(
-    `UPDATE sessions
-        SET state = 'ended', end_reason = 'session_expired', ended_at = ?
-      WHERE org_id = ? AND state = 'active' AND expires_at <= ?`
-  ).run(at, orgId, at);
-}
-
 function sessionRow(db, id, orgId) {
   return db.prepare(
     `SELECT id, org_id, user_id, device_id, mode, state, end_reason,
@@ -27,18 +21,6 @@ function sessionRow(db, id, orgId) {
        FROM sessions
       WHERE id = ? AND org_id = ?`
   ).get(id, orgId);
-}
-
-function activeGrantIds(db, { userId, orgId, deviceId, at }) {
-  return db.prepare(
-    `SELECT DISTINCT g.id
-       FROM grants g
-      WHERE g.user_id = ? AND g.org_id = ? AND g.revoked_at IS NULL
-        AND (g.device_id IS NULL OR g.device_id = ?)
-        AND (g.starts_at IS NULL OR g.starts_at <= ?)
-        AND (g.expires_at IS NULL OR ? < g.expires_at)
-      ORDER BY g.id`
-  ).all(userId, orgId, deviceId, at, at).map((row) => row.id);
 }
 
 function parseMode(value) {
@@ -64,39 +46,40 @@ export function registerSessionRoutes(router, { db }) {
     const mode = parseMode(ctx.body.mode);
     if (!activeDevice(db, ctx.orgId, deviceId)) throw notFound();
 
-    assertCanStartSession(db, ctx, mode, deviceId);
+    auditDenials(db, ctx, {
+      action: 'session.start', targetType: 'device', targetId: deviceId,
+    }, () => assertCanStartSession(db, ctx, mode, deviceId));
 
     const startedAt = nowIso();
-    const expiresAt = new Date(
-      Date.parse(startedAt) + Number(ctx.organization.max_session_minutes) * 60_000
-    ).toISOString();
-    const authorizedBy = {
-      role: ctx.role,
-      grantIds: activeGrantIds(db, {
-        userId: ctx.userId,
-        orgId: ctx.orgId,
-        deviceId,
-        at: startedAt,
-      }),
-      snapshotAt: startedAt,
-    };
+    const expiresAt = sessionExpiry(db, ctx.orgId, startedAt);
+    const authorizedBy = snapshotAuthority(db, {
+      userId: ctx.userId,
+      orgId: ctx.orgId,
+      deviceId,
+    });
     const id = newId('ses');
 
     try {
-      db.prepare(
-        `INSERT INTO sessions
-           (id, org_id, user_id, device_id, mode, state, authorized_by, started_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`
-      ).run(
-        id,
-        ctx.orgId,
-        ctx.userId,
-        deviceId,
-        mode,
-        JSON.stringify(authorizedBy),
-        startedAt,
-        expiresAt
-      );
+      db.transaction(() => {
+        db.prepare(
+          `INSERT INTO sessions
+             (id, org_id, user_id, device_id, mode, state, authorized_by, started_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`
+        ).run(
+          id,
+          ctx.orgId,
+          ctx.userId,
+          deviceId,
+          mode,
+          JSON.stringify(authorizedBy),
+          startedAt,
+          expiresAt
+        );
+        audit(db, {
+          orgId: ctx.orgId, actorId: ctx.userId, action: 'session.start',
+          targetType: 'session', targetId: id, result: 'allow', requestId: ctx.requestId,
+        });
+      })();
     } catch (error) {
       if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         throw deviceBusy(sessionBusyMessage(db, deviceId));
@@ -108,9 +91,11 @@ export function registerSessionRoutes(router, { db }) {
   });
 
   router.get('/v1/orgs/:org/sessions', (ctx, _params, res) => {
-    assertCan(db, ctx, 'session:view');
+    auditDenials(db, ctx, {
+      action: 'session.list', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'session:view'));
     const at = nowIso();
-    expireSessions(db, ctx.orgId, at);
+    endExpiredSessions(db, ctx.orgId, at);
     const sessions = db.prepare(
       `SELECT id, org_id, user_id, device_id, mode, state, end_reason,
               authorized_by, started_at, expires_at, ended_at
@@ -123,10 +108,12 @@ export function registerSessionRoutes(router, { db }) {
 
   router.get('/v1/sessions/:id', (ctx, params, res) => {
     const at = nowIso();
-    expireSessions(db, ctx.orgId, at);
+    endExpiredSessions(db, ctx.orgId, at);
     const session = sessionRow(db, params.id, ctx.orgId);
     if (!session) throw notFound();
-    if (session.user_id !== ctx.userId) assertCan(db, ctx, 'session:view');
+    if (session.user_id !== ctx.userId) auditDenials(db, ctx, {
+      action: 'session.view', targetType: 'session', targetId: session.id,
+    }, () => assertCan(db, ctx, 'session:view'));
     send(res, 200, session);
   });
 
@@ -134,13 +121,24 @@ export function registerSessionRoutes(router, { db }) {
     const session = sessionRow(db, params.id, ctx.orgId);
     if (!session) throw notFound();
     const own = session.user_id === ctx.userId;
-    if (!own) assertCan(db, ctx, 'session:terminate');
+    if (!own) auditDenials(db, ctx, {
+      action: 'session.terminate', targetType: 'session', targetId: session.id,
+    }, () => assertCan(db, ctx, 'session:terminate'));
     if (session.state === 'active') {
-      db.prepare(
-        `UPDATE sessions
-            SET state = 'ended', end_reason = ?, ended_at = ?
-          WHERE id = ? AND org_id = ? AND state = 'active'`
-      ).run(own ? 'user_stopped' : 'admin_terminated', nowIso(), session.id, ctx.orgId);
+      endActiveSessions(db, {
+        orgId: ctx.orgId,
+        sessionId: session.id,
+        reason: own ? 'user_stopped' : 'admin_terminated',
+      });
+      audit(db, {
+        orgId: ctx.orgId,
+        actorId: ctx.userId,
+        action: own ? 'session.stop' : 'session.terminate',
+        targetType: 'session',
+        targetId: session.id,
+        result: 'allow',
+        requestId: ctx.requestId,
+      });
     }
     send(res, 200, { session: sessionRow(db, session.id, ctx.orgId) });
   });

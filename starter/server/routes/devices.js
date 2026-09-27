@@ -1,5 +1,7 @@
 import { can, assertCan, assertMayGrant, resolveDevices } from '../permissions.js';
 import { bumpPermVersion, newId, nowIso } from '../db.js';
+import { endActiveSessions } from '../lifecycle.js';
+import { audit, auditDenials } from '../audit.js';
 import { badRequest, conflict, forbidden, notFound, normalizeTs, send } from '../http.js';
 
 const DEVICE_KINDS = new Set(['macos', 'windows', 'linux', 'android', 'ios']);
@@ -94,7 +96,9 @@ function activeMember(db, orgId, userId) {
 
 export function registerDeviceRoutes(router, { db }) {
   router.get('/v1/orgs/:org/devices', (ctx, params, res) => {
-    assertCan(db, ctx, 'device:list');
+    auditDenials(db, ctx, {
+      action: 'device.list', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'device:list'));
     const rows = db.prepare(
       `SELECT id, org_id, name, kind, online
          FROM devices
@@ -124,16 +128,24 @@ export function registerDeviceRoutes(router, { db }) {
   });
 
   router.post('/v1/orgs/:org/devices', (ctx, _params, res) => {
-    assertCan(db, ctx, 'device:provision');
+    auditDenials(db, ctx, {
+      action: 'device.create', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'device:provision'));
     const name = text(ctx.body.name, 'name');
     const kind = validateKind(ctx.body.kind);
     const online = ctx.body.online === undefined ? 0 : validateOnline(ctx.body.online);
     const id = newId('dev');
     try {
-      db.prepare(
-        `INSERT INTO devices (id, org_id, name, kind, online)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(id, ctx.orgId, name, kind, online);
+      db.transaction(() => {
+        db.prepare(
+          `INSERT INTO devices (id, org_id, name, kind, online)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(id, ctx.orgId, name, kind, online);
+        audit(db, {
+          orgId: ctx.orgId, actorId: ctx.userId, action: 'device.create',
+          targetType: 'device', targetId: id, result: 'allow', requestId: ctx.requestId,
+        });
+      })();
     } catch (error) {
       if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') throw conflict('device already exists');
       throw error;
@@ -149,7 +161,9 @@ export function registerDeviceRoutes(router, { db }) {
   router.patch('/v1/orgs/:org/devices/:id', (ctx, params, res) => {
     const row = findDevice(db, ctx.orgId, params.id);
     if (!row) throw notFound();
-    assertCan(db, ctx, 'device:update', row.id);
+    auditDenials(db, ctx, {
+      action: 'device.update', targetType: 'device', targetId: row.id,
+    }, () => assertCan(db, ctx, 'device:update', row.id));
     const updates = [];
     const values = [];
     if (ctx.body.name !== undefined) {
@@ -166,7 +180,13 @@ export function registerDeviceRoutes(router, { db }) {
     }
     if (!updates.length) throw badRequest('no device fields to update');
     values.push(row.id, ctx.orgId);
-    db.prepare(`UPDATE devices SET ${updates.join(', ')} WHERE id = ? AND org_id = ?`).run(...values);
+    db.transaction(() => {
+      db.prepare(`UPDATE devices SET ${updates.join(', ')} WHERE id = ? AND org_id = ?`).run(...values);
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'device.update',
+        targetType: 'device', targetId: row.id, result: 'allow', requestId: ctx.requestId,
+      });
+    })();
     send(res, 200, { device: deviceFromRow(findDevice(db, ctx.orgId, row.id), resolveDevices(db, {
       userId: ctx.userId,
       orgId: ctx.orgId,
@@ -177,30 +197,57 @@ export function registerDeviceRoutes(router, { db }) {
   router.delete('/v1/orgs/:org/devices/:id', (ctx, params, res) => {
     const row = findDevice(db, ctx.orgId, params.id);
     if (!row) throw notFound();
-    assertCan(db, ctx, 'device:provision', row.id);
-    db.prepare('UPDATE devices SET deleted_at = ? WHERE id = ? AND org_id = ?').run(nowIso(), row.id, ctx.orgId);
+    auditDenials(db, ctx, {
+      action: 'device.decommission', targetType: 'device', targetId: row.id,
+    }, () => assertCan(db, ctx, 'device:provision', row.id));
+    const decommission = db.transaction(() => {
+      endActiveSessions(db, { orgId: ctx.orgId, deviceId: row.id, reason: 'device_transferred' });
+      db.prepare('UPDATE devices SET deleted_at = ? WHERE id = ? AND org_id = ?').run(nowIso(), row.id, ctx.orgId);
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'device.decommission',
+        targetType: 'device', targetId: row.id, result: 'allow', requestId: ctx.requestId,
+      });
+    });
+    decommission();
     send(res, 200, { ok: true });
   });
 
   router.post('/v1/orgs/:org/devices/:id/transfer', (ctx, params, res) => {
     const row = findDevice(db, ctx.orgId, params.id);
     if (!row) throw notFound();
-    assertCan(db, ctx, 'device:provision', row.id);
+    auditDenials(db, ctx, {
+      action: 'device.transfer', targetType: 'device', targetId: row.id,
+    }, () => assertCan(db, ctx, 'device:provision', row.id));
     const targetOrgId = text(ctx.body.orgId, 'orgId');
     const targetOrg = db.prepare(
       'SELECT id FROM organizations WHERE id = ? AND deleted_at IS NULL'
     ).get(targetOrgId);
     if (!targetOrg || !activeMember(db, targetOrgId, ctx.userId)) throw notFound();
     if (!can(db, { userId: ctx.userId, orgId: targetOrgId }, 'device:provision')) {
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'device.transfer',
+        targetType: 'device', targetId: row.id, result: 'deny',
+        reasonCode: 'missing_permission', requestId: ctx.requestId,
+      });
       throw forbidden('missing permission: device:provision', 'missing_permission');
     }
-    db.prepare('UPDATE devices SET org_id = ? WHERE id = ? AND org_id = ?')
-      .run(targetOrgId, row.id, ctx.orgId);
+    const transfer = db.transaction(() => {
+      endActiveSessions(db, { orgId: ctx.orgId, deviceId: row.id, reason: 'device_transferred' });
+      db.prepare('UPDATE devices SET org_id = ? WHERE id = ? AND org_id = ?')
+        .run(targetOrgId, row.id, ctx.orgId);
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'device.transfer',
+        targetType: 'device', targetId: row.id, result: 'allow', requestId: ctx.requestId,
+      });
+    });
+    transfer();
     send(res, 200, { device: { ...row, org_id: targetOrgId } });
   });
 
   router.get('/v1/orgs/:org/grants', (ctx, _params, res) => {
-    assertCan(db, ctx, 'user:read');
+    auditDenials(db, ctx, {
+      action: 'grant.list', targetType: 'organization', targetId: ctx.orgId,
+    }, () => assertCan(db, ctx, 'user:read'));
     const rows = db.prepare(
       `SELECT g.id, g.user_id, g.device_id, g.effect, g.starts_at, g.expires_at,
               g.created_by, g.revoked_at, g.created_at,
@@ -215,9 +262,18 @@ export function registerDeviceRoutes(router, { db }) {
   });
 
   router.post('/v1/orgs/:org/grants', (ctx, _params, res) => {
-    assertCan(db, ctx, 'grant:create');
+    auditDenials(db, ctx, {
+      action: 'grant.create', targetType: 'membership', targetId: ctx.body.userId ?? null,
+    }, () => assertCan(db, ctx, 'grant:create'));
     const userId = text(ctx.body.userId, 'userId');
-    if (userId === ctx.userId) throw forbidden('self-grant is forbidden', 'scope_mismatch');
+    if (userId === ctx.userId) {
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'grant.create',
+        targetType: 'membership', targetId: userId, result: 'deny',
+        reasonCode: 'scope_mismatch', requestId: ctx.requestId,
+      });
+      throw forbidden('self-grant is forbidden', 'scope_mismatch');
+    }
     if (!activeMember(db, ctx.orgId, userId)) throw notFound();
     const permissions = validateGrantPermissions(db, ctx.body.permissions);
     if (ctx.body.effect !== 'allow' && ctx.body.effect !== 'deny') throw badRequest('effect must be allow or deny');
@@ -229,7 +285,9 @@ export function registerDeviceRoutes(router, { db }) {
     const expiresAt = normalizeTs(ctx.body.expiresAt, 'expiresAt');
     if (expiresAt && expiresAt <= nowIso()) throw badRequest('grant has already expired', 'expired_grant');
     if (startsAt && expiresAt && expiresAt <= startsAt) throw badRequest('expiresAt must be after startsAt');
-    assertMayGrant(db, ctx, permissions, deviceId);
+    auditDenials(db, ctx, {
+      action: 'grant.create', targetType: 'membership', targetId: userId,
+    }, () => assertMayGrant(db, ctx, permissions, deviceId));
 
     const grantId = newId('grt');
     const write = db.transaction(() => {
@@ -242,6 +300,10 @@ export function registerDeviceRoutes(router, { db }) {
       );
       for (const permission of permissions) insertPermission.run(grantId, permission);
       bumpPermVersion(db, { orgId: ctx.orgId, userId });
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'grant.create',
+        targetType: 'grant', targetId: grantId, result: 'allow', requestId: ctx.requestId,
+      });
     });
     write();
     send(res, 201, { grant: grantResponseRow(grantRow(db, grantId, ctx.orgId)) });
@@ -250,12 +312,18 @@ export function registerDeviceRoutes(router, { db }) {
   router.delete('/v1/orgs/:org/grants/:id', (ctx, params, res) => {
     const grant = grantRow(db, params.id, ctx.orgId);
     if (!grant || grant.revoked_at) throw notFound();
-    assertCan(db, ctx, 'grant:revoke');
+    auditDenials(db, ctx, {
+      action: 'grant.revoke', targetType: 'grant', targetId: grant.id,
+    }, () => assertCan(db, ctx, 'grant:revoke'));
     const revokedAt = nowIso();
     const revoke = db.transaction(() => {
       db.prepare('UPDATE grants SET revoked_at = ? WHERE id = ? AND org_id = ? AND revoked_at IS NULL')
         .run(revokedAt, grant.id, ctx.orgId);
       bumpPermVersion(db, { orgId: ctx.orgId, userId: grant.user_id });
+      audit(db, {
+        orgId: ctx.orgId, actorId: ctx.userId, action: 'grant.revoke',
+        targetType: 'grant', targetId: grant.id, result: 'allow', requestId: ctx.requestId,
+      });
     });
     revoke();
     send(res, 200, { ok: true });
